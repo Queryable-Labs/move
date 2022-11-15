@@ -23,3 +23,4 @@ pub mod transaction_argument;
 mod unit_tests;
 pub mod value;
 pub mod vm_status;
+pub mod trace;
