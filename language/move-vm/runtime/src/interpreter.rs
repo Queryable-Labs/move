@@ -16,8 +16,10 @@ use move_core_types::{
     account_address::AccountAddress,
     gas_algebra::{NumArgs, NumBytes},
     language_storage::TypeTag,
+    trace::{CallTrace, CallType},
     vm_status::{StatusCode, StatusType},
 };
+use move_core_types::value::MoveTypeLayout;
 use move_vm_types::{
     data_store::DataStore,
     gas::{GasMeter, SimpleInstruction},
@@ -30,8 +32,8 @@ use move_vm_types::{
 };
 
 use crate::native_extensions::NativeContextExtensions;
-use std::{cmp::min, collections::VecDeque, fmt::Write, sync::Arc};
-use tracing::error;
+use std::{cmp::min, collections::VecDeque, fmt::Write, mem, sync::Arc};
+use tracing::{error, warn};
 
 macro_rules! debug_write {
     ($($toks: tt)*) => {
@@ -67,6 +69,13 @@ pub(crate) struct Interpreter {
     operand_stack: Stack,
     /// The stack of active functions.
     call_stack: CallStack,
+    /// List of captured call traces
+    call_traces: Vec<CallTrace>,
+}
+
+pub(crate) struct InterpreterEntrypointResult {
+    pub values: VMResult<Vec<Value>>,
+    pub call_traces: Vec<CallTrace>,
 }
 
 struct TypeWithLoader<'a, 'b> {
@@ -91,14 +100,21 @@ impl Interpreter {
         gas_meter: &mut impl GasMeter,
         extensions: &mut NativeContextExtensions,
         loader: &Loader,
-    ) -> VMResult<Vec<Value>> {
-        Interpreter {
+    ) -> VMResult<InterpreterEntrypointResult> {
+        let mut interp = Interpreter {
             operand_stack: Stack::new(),
             call_stack: CallStack::new(),
-        }
-        .execute_main(
+            call_traces: Vec::new(),
+        };
+
+        let values = interp.execute_main(
             loader, data_store, gas_meter, extensions, function, ty_args, args,
-        )
+        );
+
+        Ok(InterpreterEntrypointResult {
+            values,
+            call_traces: interp.call_traces,
+        })
     }
 
     /// Main loop for the execution of a function.
@@ -108,7 +124,7 @@ impl Interpreter {
     /// on call. When that happens the frame is changes to a new one (call) or to the one
     /// at the top of the stack (return). If the call stack is empty execution is completed.
     fn execute_main(
-        mut self,
+        &mut self,
         loader: &Loader,
         data_store: &mut impl DataStore,
         gas_meter: &mut impl GasMeter,
@@ -124,13 +140,72 @@ impl Interpreter {
                 .map_err(|e| self.set_location(e))?;
         }
 
-        let mut current_frame = Frame::new(function, ty_args, locals);
+        let mut current_frame = Frame::new(function, ty_args, locals, 0);
+
+        let (args_types, args_values) =
+            current_frame.extract_types_and_arguments(loader, data_store);
+
+        let call_trace = CallTrace {
+            depth: self.call_stack.len() as u32,
+            call_type: match current_frame.ty_args.len() > 0 {
+                true => CallType::CallGeneric,
+                false => CallType::Call,
+            },
+            module_id: if let Some(module_id) = current_frame.function.module_id() {
+                Some(module_id.short_str_lossless())
+            } else {
+                None
+            },
+            function: current_frame.function.name().into(),
+            ty_args: current_frame
+                .ty_args
+                .iter()
+                .map(|ty| {
+                    loader.type_to_type_layout(&ty).unwrap().to_string().into_bytes()
+                })
+                .collect(),
+            args_types: args_types.clone(),
+            args_values: args_values.clone(),
+            gas_used: 0,
+            err: None,
+        };
+
+        self.call_traces.push(call_trace);
+
+        let mut gas_used_before_call = gas_meter.charged_already_total().unwrap();
+
         loop {
             let resolver = current_frame.resolver(loader);
             let exit_code =
                 current_frame //self
-                    .execute_code(&resolver, &mut self, data_store, gas_meter)
-                    .map_err(|err| self.maybe_core_dump(err, &current_frame))?;
+                    .execute_code(&resolver, self, data_store, gas_meter)
+                    .map_err(|err| {
+                        let gas_used_after_call = gas_meter.charged_already_total().unwrap();
+
+                        if let Some(call_trace) = self.call_traces.get_mut(current_frame.call_trace_index) {
+                            call_trace.err = Some(err.clone().into_vm_status());
+                            call_trace.gas_used += gas_used_after_call
+                                .checked_sub(gas_used_before_call)
+                                .unwrap()
+                                .value();
+                        }
+
+                        self.maybe_core_dump(err, &current_frame)
+                    })?;
+
+            let gas_used_after_call = gas_meter.charged_already_total().unwrap();
+
+            if let Some(call_trace) = self.call_traces.get_mut(current_frame.call_trace_index) {
+                call_trace.gas_used += gas_used_after_call
+                    .checked_sub(gas_used_before_call)
+                    .unwrap()
+                    .value();
+            } else {
+                warn!("Failed to locate Call Trace after successful frame execution");
+            }
+
+            gas_used_before_call = gas_used_after_call;
+
             match exit_code {
                 ExitCode::Return => {
                     let non_ref_vals = current_frame
@@ -141,7 +216,21 @@ impl Interpreter {
                     // TODO: Check if the error location is set correctly.
                     gas_meter
                         .charge_drop_frame(non_ref_vals.into_iter())
-                        .map_err(|e| self.set_location(e))?;
+                        .map_err(|e| {
+                            let err = self.set_location(e);
+
+                            let gas_used_after_call = gas_meter.charged_already_total().unwrap();
+
+                            if let Some(call_trace) = self.call_traces.get_mut(current_frame.call_trace_index) {
+                                call_trace.err = Some(err.clone().into_vm_status());
+                                call_trace.gas_used += gas_used_after_call
+                                    .checked_sub(gas_used_before_call)
+                                    .unwrap()
+                                    .value();
+                            }
+
+                            err
+                        })?;
 
                     if let Some(frame) = self.call_stack.pop() {
                         // Note: the caller will find the callee's return values at the top of the shared operand stack
@@ -149,7 +238,7 @@ impl Interpreter {
                         current_frame.pc += 1; // advance past the Call instruction in the caller
                     } else {
                         // end of execution. `self` should no longer be used afterward
-                        return Ok(self.operand_stack.0);
+                        return Ok(mem::take(&mut self.operand_stack.0));
                     }
                 }
                 ExitCode::Call(fh_idx) => {
@@ -187,7 +276,7 @@ impl Interpreter {
                         continue;
                     }
                     let frame = self
-                        .make_call_frame(func, vec![])
+                        .make_call_frame(func, vec![], loader, data_store)
                         .map_err(|err| self.maybe_core_dump(err, &current_frame))?;
                     self.call_stack.push(current_frame).map_err(|frame| {
                         let err = PartialVMError::new(StatusCode::CALL_STACK_OVERFLOW);
@@ -232,7 +321,7 @@ impl Interpreter {
                         continue;
                     }
                     let frame = self
-                        .make_call_frame(func, ty_args)
+                        .make_call_frame(func, ty_args, loader, data_store)
                         .map_err(|err| self.maybe_core_dump(err, &current_frame))?;
                     self.call_stack.push(current_frame).map_err(|frame| {
                         let err = PartialVMError::new(StatusCode::CALL_STACK_OVERFLOW);
@@ -250,7 +339,7 @@ impl Interpreter {
     ///
     /// Native functions do not push a frame at the moment and as such errors from a native
     /// function are incorrectly attributed to the caller.
-    fn make_call_frame(&mut self, func: Arc<Function>, ty_args: Vec<Type>) -> VMResult<Frame> {
+    fn make_call_frame(&mut self, func: Arc<Function>, ty_args: Vec<Type>, loader: &Loader, data_store: &mut impl DataStore) -> VMResult<Frame> {
         let mut locals = Locals::new(func.local_count());
         let arg_count = func.arg_count();
         for i in 0..arg_count {
@@ -261,7 +350,40 @@ impl Interpreter {
                 )
                 .map_err(|e| self.set_location(e))?;
         }
-        Ok(Frame::new(func, ty_args, locals))
+
+        let frame = Frame::new(func, ty_args, locals, self.call_traces.len());
+
+        let (args_types, args_values) =
+            frame.extract_types_and_arguments(loader, data_store);
+
+        let call_trace = CallTrace {
+            depth: self.call_stack.len() as u32,
+            call_type: match frame.ty_args.len() > 0 {
+                true => CallType::CallGeneric,
+                false => CallType::Call,
+            },
+            module_id: if let Some(module_id) = frame.function.module_id() {
+                Some(module_id.short_str_lossless())
+            } else {
+                None
+            },
+            function: frame.function.name().into(),
+            ty_args: frame
+                .ty_args
+                .iter()
+                .map(|ty| {
+                    loader.type_to_type_layout(&ty).unwrap().to_string().into_bytes()
+                })
+                .collect(),
+            args_types: args_types.clone(),
+            args_values: args_values.clone(),
+            gas_used: 0,
+            err: None,
+        };
+
+        self.call_traces.push(call_trace);
+
+        Ok(frame)
     }
 
     /// Call a native functions.
@@ -815,6 +937,10 @@ impl CallStack {
         let location_opt = self.0.last().map(|frame| frame.location());
         location_opt.unwrap_or(Location::Undefined)
     }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
 }
 
 /// A `Frame` is the execution context for a function. It holds the locals of the function and
@@ -825,6 +951,7 @@ struct Frame {
     locals: Locals,
     function: Arc<Function>,
     ty_args: Vec<Type>,
+    call_trace_index: usize,
 }
 
 /// An `ExitCode` from `execute_code_unit`.
@@ -839,12 +966,13 @@ impl Frame {
     /// Create a new `Frame` given a `Function` and the function `Locals`.
     ///
     /// The locals must be loaded before calling this.
-    fn new(function: Arc<Function>, ty_args: Vec<Type>, locals: Locals) -> Self {
+    fn new(function: Arc<Function>, ty_args: Vec<Type>, locals: Locals, call_trace_index: usize) -> Self {
         Frame {
             pc: 0,
             locals,
             function,
             ty_args,
+            call_trace_index,
         }
     }
 
@@ -1471,5 +1599,68 @@ impl Frame {
             None => Location::Script,
             Some(id) => Location::Module(id.clone()),
         }
+    }
+
+    fn extract_types_and_arguments(
+        &self,
+        loader: &Loader,
+        data_store: &mut impl DataStore,
+    ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        if self.function.module_id().is_none() {
+            return (vec![], vec![]);
+        }
+
+        let function_parameters: Vec<Type> = loader
+            .function_parameters(
+                &self.function,
+                self.function.module_id().unwrap(),
+                data_store,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|ty| ty.subst(&self.ty_args))
+            .collect::<PartialVMResult<Vec<_>>>()
+            .map_err(|err| err.finish(Location::Undefined))
+            .unwrap();
+
+        let mut args_types: Vec<Vec<u8>> = vec![];
+        let mut args_values: Vec<Vec<u8>> = vec![];
+
+        for i in 0..function_parameters.len() {
+            let arg_type = function_parameters.get(i.clone()).unwrap();
+
+            let arg_type_layout: MoveTypeLayout;
+            let arg_value: Vec<u8>;
+
+            match arg_type {
+                Type::Reference(_) | Type::MutableReference(_) => {
+                    arg_type_layout = loader.reference_type_to_type_layout(arg_type).unwrap();
+
+                    let value = self.locals.copy_loc(i);
+
+                    let unwrapped_value = value.unwrap();
+
+                    let ref_value = unwrapped_value.value_as::<Reference>().unwrap();
+
+                    arg_value = ref_value
+                        .read_ref()
+                        .unwrap()
+                        .simple_serialize(&arg_type_layout)
+                        .unwrap();
+                }
+                _ => {
+                    arg_type_layout = loader.type_to_type_layout(arg_type).unwrap();
+
+                    let value = self.locals.copy_loc(i.clone()).unwrap();
+
+                    arg_value = value.simple_serialize(&arg_type_layout).unwrap();
+                }
+            }
+
+            args_types.push(arg_type_layout.to_string().into_bytes());
+            args_values.push(arg_value);
+        }
+
+        (args_types, args_values)
     }
 }

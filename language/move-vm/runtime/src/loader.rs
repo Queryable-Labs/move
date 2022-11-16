@@ -730,6 +730,35 @@ impl Loader {
         Ok((module, func, loaded))
     }
 
+    pub(crate) fn function_parameters(
+        &self,
+        func: &Arc<Function>,
+        module_id: &ModuleId,
+        data_store: &impl DataStore,
+    ) -> VMResult<Vec<Type>> {
+        let module = self.load_module(module_id, data_store)?;
+
+        Ok(self.function_parameters_with_module(func, &module)?)
+    }
+
+    pub(crate) fn function_parameters_with_module(
+        &self,
+        func: &Arc<Function>,
+        module: &Arc<Module>,
+    ) -> VMResult<Vec<Type>> {
+        Ok(func
+            .parameters
+            .0
+            .iter()
+            .map(|tok| {
+                self.module_cache
+                    .read()
+                    .make_type(BinaryIndexedView::Module(module.module()), tok)
+            })
+            .collect::<PartialVMResult<Vec<_>>>()
+            .map_err(|err| err.finish(Location::Undefined))?)
+    }
+
     // Entry point for module publishing (`MoveVM::publish_module_bundle`).
     //
     // All modules in the bundle to be published must be loadable. This function performs all
@@ -2427,6 +2456,32 @@ impl Loader {
                 )
             }
         })
+    }
+
+    fn reference_type_to_type_layout_impl(
+        &self,
+        ty: &Type,
+        depth: usize,
+    ) -> PartialVMResult<MoveTypeLayout> {
+        if depth > VALUE_DEPTH_MAX {
+            return Err(PartialVMError::new(StatusCode::VM_MAX_VALUE_DEPTH_REACHED));
+        }
+        Ok(match ty {
+            Type::Vector(ty) => MoveTypeLayout::Vector(Box::new(
+                self.reference_type_to_type_layout_impl(ty, depth + 1)?,
+            )),
+            Type::Reference(ty) | Type::MutableReference(ty) => {
+                self.reference_type_to_type_layout_impl(ty, depth + 1)?
+            }
+            _ => self.type_to_type_layout_impl(ty, depth + 1)?,
+        })
+    }
+
+    pub(crate) fn reference_type_to_type_layout(
+        &self,
+        ty: &Type,
+    ) -> PartialVMResult<MoveTypeLayout> {
+        self.reference_type_to_type_layout_impl(ty, 1)
     }
 
     pub(crate) fn type_to_type_tag(&self, ty: &Type) -> PartialVMResult<TypeTag> {

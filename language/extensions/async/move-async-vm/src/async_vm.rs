@@ -221,6 +221,7 @@ impl<'r, 'l, S: MoveResolver> AsyncSession<'r, 'l, S> {
                 SerializedReturnValues {
                     mutable_reference_outputs: _,
                     mut return_values,
+                    call_traces: _,
                 },
                 (mut change_set, events, mut native_extensions),
             )) => {
@@ -314,6 +315,7 @@ impl<'r, 'l, S: MoveResolver> AsyncSession<'r, 'l, S> {
                 SerializedReturnValues {
                     mut mutable_reference_outputs,
                     return_values: _,
+                    call_traces: _,
                 },
                 (mut change_set, events, mut native_extensions),
             )) => {

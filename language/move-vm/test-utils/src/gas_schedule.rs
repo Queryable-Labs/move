@@ -111,6 +111,7 @@ static ZERO_COST_SCHEDULE: Lazy<CostTable> = Lazy::new(zero_cost_schedule);
 /// Every client must use an instance of this type to interact with the Move VM.
 pub struct GasStatus<'a> {
     cost_table: &'a CostTable,
+    original_gas_left: InternalGas,
     gas_left: InternalGas,
     charge: bool,
 }
@@ -122,6 +123,7 @@ impl<'a> GasStatus<'a> {
     /// This is the instantiation that must be used when executing a user script.
     pub fn new(cost_table: &'a CostTable, gas_left: Gas) -> Self {
         Self {
+            original_gas_left: gas_left.to_unit(),
             gas_left: gas_left.to_unit(),
             cost_table,
             charge: true,
@@ -134,6 +136,7 @@ impl<'a> GasStatus<'a> {
     /// code that does not have to charge the user.
     pub fn new_unmetered() -> Self {
         Self {
+            original_gas_left: InternalGas::new(0),
             gas_left: InternalGas::new(0),
             cost_table: &ZERO_COST_SCHEDULE,
             charge: false,
@@ -261,6 +264,11 @@ fn get_simple_instruction_opcode(instr: SimpleInstruction) -> Opcodes {
 }
 
 impl<'b> GasMeter for GasStatus<'b> {
+    fn charged_already_total(&self) -> PartialVMResult<InternalGas> {
+        let used_gas = self.original_gas_left.checked_sub(self.gas_left).unwrap();
+
+        Ok(used_gas)
+    }
     /// Charge an instruction and fail if not enough gas units are left.
     fn charge_simple_instr(&mut self, instr: SimpleInstruction) -> PartialVMResult<()> {
         self.charge_instr(get_simple_instruction_opcode(instr))

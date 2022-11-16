@@ -25,6 +25,7 @@ use move_vm_types::{
     loaded_data::runtime_types::{CachedStructIndex, StructType, Type},
 };
 use std::{borrow::Borrow, sync::Arc};
+use move_core_types::trace::CallTrace;
 
 pub struct Session<'r, 'l, S> {
     pub(crate) runtime: &'l VMRuntime,
@@ -41,6 +42,8 @@ pub struct SerializedReturnValues {
     pub mutable_reference_outputs: Vec<(LocalIndex, Vec<u8>, MoveTypeLayout)>,
     /// The return values from the function
     pub return_values: Vec<(Vec<u8>, MoveTypeLayout)>,
+    /// The call traces after function invocation
+    pub call_traces: Vec<CallTrace>,
 }
 
 impl<'r, 'l, S: MoveResolver> Session<'r, 'l, S> {
