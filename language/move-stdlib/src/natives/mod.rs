@@ -113,10 +113,10 @@ pub fn all_natives(
     add_natives!("signer", signer::make_all(gas_params.signer));
     add_natives!("string", string::make_all(gas_params.string));
     add_natives!("vector", vector::make_all(gas_params.vector));
-    #[cfg(feature = "testing")]
-    {
-        add_natives!("unit_test", unit_test::make_all(gas_params.unit_test));
-    }
+    // #[cfg(feature = "testing")]
+    // {
+    //     add_natives!("unit_test", unit_test::make_all(gas_params.unit_test));
+    // }
 
     make_table_from_iter(move_std_addr, natives)
 }
