@@ -372,7 +372,13 @@ impl Interpreter {
                 .ty_args
                 .iter()
                 .map(|ty| {
-                    loader.type_to_type_layout(&ty).unwrap().to_string().into_bytes()
+                    match loader.type_to_type_layout(&ty) {
+                        Err(err) => {
+                            warn!("Failed to convert type to type_layout, error: {}", err);
+                            vec![]
+                        },
+                        Ok(value) => value.to_string().into_bytes()
+                    }
                 })
                 .collect(),
             args_types: args_types.clone(),
@@ -1610,7 +1616,7 @@ impl Frame {
             return (vec![], vec![]);
         }
 
-        let function_parameters: Vec<Type> = loader
+        let function_parameters_result = loader
             .function_parameters(
                 &self.function,
                 self.function.module_id().unwrap(),
@@ -1619,43 +1625,137 @@ impl Frame {
             .unwrap()
             .into_iter()
             .map(|ty| ty.subst(&self.ty_args))
-            .collect::<PartialVMResult<Vec<_>>>()
-            .map_err(|err| err.finish(Location::Undefined))
-            .unwrap();
+            .collect::<PartialVMResult<Vec<_>>>();
+
+        if function_parameters_result.is_err() {
+
+        }
+
+        let function_parameters: Vec<Type> = match function_parameters_result {
+            Err(err) => {
+                warn!("Failed to extract function parameters, {}", err);
+
+                return (vec![], vec![]);
+            }
+            Ok(value) => value
+        };
 
         let mut args_types: Vec<Vec<u8>> = vec![];
         let mut args_values: Vec<Vec<u8>> = vec![];
 
         for i in 0..function_parameters.len() {
-            let arg_type = function_parameters.get(i.clone()).unwrap();
+            let arg_type_result = function_parameters.get(i.clone());
+
+            let arg_type = match arg_type_result {
+                Some(arg_type) => arg_type,
+                None => {
+                    warn!("Failed to get function parameter by index {}", i);
+
+                    continue;
+                }
+            };
 
             let arg_type_layout: MoveTypeLayout;
             let arg_value: Vec<u8>;
 
             match arg_type {
                 Type::Reference(_) | Type::MutableReference(_) => {
-                    arg_type_layout = loader.reference_type_to_type_layout(arg_type).unwrap();
+                    arg_type_layout = match loader.reference_type_to_type_layout(arg_type) {
+                        Err(err) => {
+                            warn!(
+                            "Failed to convert reference type to type layout, error: {}",
+                            err
+                        );
 
-                    let value = self.locals.copy_loc(i);
+                            continue;
+                        }
+                        Ok(value) => value
+                    };
 
-                    let unwrapped_value = value.unwrap();
+                    let value = match self.locals.copy_loc(i.clone()) {
+                        Err(err) => {
+                            warn!(
+                            "Failed to copy primitive form loc: {}, error: {}",
+                            i.clone(),
+                            err
+                        );
 
-                    let ref_value = unwrapped_value.value_as::<Reference>().unwrap();
+                            continue;
+                        },
+                        Ok(value) => value
+                    };
 
-                    arg_value = ref_value
-                        .read_ref()
-                        .unwrap()
-                        .simple_serialize(&arg_type_layout)
-                        .unwrap();
+                    let ref_value = match value.value_as::<Reference>() {
+                        Err(err) => {
+                            warn!(
+                            "Failed to convert reference as value reference, error: {}",
+                            err
+                        );
+
+                            continue;
+                        }
+                        Ok(value) => value
+                    };
+
+                    let ref_arg_value = match ref_value.read_ref() {
+                        Err(err) => {
+                            warn!(
+                            "Failed to read reference, error: {}",
+                            err
+                        );
+
+                            continue;
+                        }
+                        Ok(value) => value
+                    };
+
+                    let arg_value_result = ref_arg_value.simple_serialize(&arg_type_layout);
+
+                    arg_value = match arg_value_result {
+                        Some(arg_value) => arg_value,
+                        None => {
+                            warn!("Failed to serialize primitive");
+
+                            vec![]
+                        }
+                    };
                 }
                 _ => {
-                    arg_type_layout = loader.type_to_type_layout(arg_type).unwrap();
+                    arg_type_layout = match loader.type_to_type_layout(&arg_type) {
+                        Err(err) => {
+                            warn!(
+                                "Failed to convert primitive type to type layout, error: {}",
+                                err
+                            );
 
-                    let value = self.locals.copy_loc(i.clone()).unwrap();
+                            continue;
+                        }
+                        Ok(value) => value
+                    };
 
-                    arg_value = value.simple_serialize(&arg_type_layout).unwrap();
+                    let value = match self.locals.copy_loc(i.clone()) {
+                        Err(err) => {
+                            warn!(
+                                "Failed to copy primitive form loc: {}, error: {}",
+                                i.clone(),
+                                err
+                            );
+
+                            continue;
+                        }
+                        Ok(value) => value
+                    };
+
+                    arg_value = match value.simple_serialize(&arg_type_layout) {
+                        Some(arg_value) => arg_value,
+                        None => {
+                            warn!("Failed to serialize primitive");
+
+                            vec![]
+                        }
+                    };
                 }
-            }
+            };
 
             args_types.push(arg_type_layout.to_string().into_bytes());
             args_values.push(arg_value);

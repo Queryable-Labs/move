@@ -2330,14 +2330,15 @@ impl Loader {
             .collect::<PartialVMResult<Vec<_>>>()?;
         let struct_layout = MoveStructLayout::new(field_layouts);
 
-        self.type_cache
-            .write()
-            .structs
-            .entry(gidx)
-            .or_insert_with(HashMap::new)
-            .entry(ty_args.to_vec())
-            .or_insert_with(StructInfo::new)
-            .struct_layout = Some(struct_layout.clone());
+        // @TODO: temporary commented, as it cause failure to run move unit tests...
+        // self.type_cache
+        //     .write()
+        //     .structs
+        //     .entry(gidx)
+        //     .or_insert_with(HashMap::new)
+        //     .entry(ty_args.to_vec())
+        //     .or_insert_with(StructInfo::new)
+        //     .struct_layout = Some(struct_layout.clone());
 
         Ok(struct_layout)
     }
