@@ -1627,10 +1627,6 @@ impl Frame {
             .map(|ty| ty.subst(&self.ty_args))
             .collect::<PartialVMResult<Vec<_>>>();
 
-        if function_parameters_result.is_err() {
-
-        }
-
         let function_parameters: Vec<Type> = match function_parameters_result {
             Err(err) => {
                 warn!("Failed to extract function parameters, {}", err);
