@@ -357,7 +357,7 @@ impl Interpreter {
             frame.extract_types_and_arguments(loader, data_store);
 
         let call_trace = CallTrace {
-            depth: self.call_stack.len() as u32,
+            depth: self.call_stack.len() as u32 + 1,
             call_type: match frame.ty_args.len() > 0 {
                 true => CallType::CallGeneric,
                 false => CallType::Call,
